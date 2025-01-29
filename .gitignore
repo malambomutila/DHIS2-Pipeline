@@ -175,3 +175,4 @@ cython_debug/
 .ipynb_checkpoints/
 *.csv
 00_Local/
+querydata copy.ipynb
