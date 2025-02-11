@@ -173,6 +173,7 @@ cython_debug/
 
 # Project Configuration Files
 .ipynb_checkpoints/
-*.csv
 00_Local/
-querydata copy.ipynb
+02_Fetch_Data/
+*.csv
+*.ipynb
