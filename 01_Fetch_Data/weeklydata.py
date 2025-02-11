@@ -1,3 +1,4 @@
+# ------ Import Packages and Libraries -----------------------------------------------------------
 import pandas as pd
 import requests
 import json
@@ -8,6 +9,7 @@ import logging
 import ast
 import math
 
+# ------ Directories, Credentials and Data Fetching and Transformation ---------------------------
 class DHIS2DataExtractor:
     def __init__(self, base_dir=None):
         # Setup logging
