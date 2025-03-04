@@ -1,4 +1,3 @@
-# ------ Import Packages and Libraries -----------------------------------------------------------
 import pandas as pd
 import requests
 import json
@@ -6,7 +5,6 @@ from pathlib import Path
 from requests.auth import HTTPBasicAuth
 from datetime import datetime, timedelta
 import logging
-import ast
 import math
 
 # ------ Directories, Credentials and Data Fetching and Transformation ---------------------------
@@ -19,7 +17,7 @@ class DHIS2DataExtractor:
         # Setup paths
         self.base_dir = Path.cwd().parent if base_dir is None else Path(base_dir)
         self.credentials_path = self.base_dir / '00_Local' / '01_Configs' / 'credentials.txt'
-        self.data_dir = self.base_dir / '00_Local' / '02_Data'
+        self.data_dir = self.base_dir / '01_Fetch_Data' / 'exports'
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
         # DHIS2 configurations
@@ -27,14 +25,15 @@ class DHIS2DataExtractor:
         self.PAT = None
         self.HEADERS = None
         self.API_ENDPOINT_ANALYTICS = "/api/40/analytics.json"
-        self.API_ENDPOINT_DATA_ELEMENTS = "/api/40/dataElements.json"
+        self.API_ENDPOINT_DATA_SETS = "/api/40/dataSets/L5MxHpPrfFD.json"  # Fixed variable name
         self.BATCH_SIZE = 200
         
         # Initialize configurations
+        self.all_data_elements_df = None  # Initialize DataFrame for data elements
         self._load_credentials()
         
     def _load_credentials(self):
-        # Load DHIS2 credentials from text file.
+        """Load DHIS2 credentials from text file."""
         try:
             credentials = {}
             with self.credentials_path.open('r') as file:
@@ -53,9 +52,7 @@ class DHIS2DataExtractor:
             raise
     
     def get_week_range(self, year=None, week=None):
-        # Gets the start and end dates for a specific week.
-        # Returns current week if no parameters are provided.
-        
+        """Get the start and end dates for a specific epidemiological week."""
         if year is None or week is None:
             today = datetime.today()
             year = today.year
@@ -67,34 +64,62 @@ class DHIS2DataExtractor:
         return start_date, end_date, f"{year}W{week}"  # DHIS2 period format
     
     def fetch_aggregatable_data_elements(self):
-        # Fetches all numeric data elements that allow aggregation.
-        response = requests.get(
-            f"{self.DHIS2_URL}{self.API_ENDPOINT_DATA_ELEMENTS}?fields=id,valueType,aggregationType&paging=false",
-            headers=self.HEADERS
-        )
+        """Fetches all numeric data elements from the specified dataset and stores them in a DataFrame."""
         
+        url = f"{self.DHIS2_URL}{self.API_ENDPOINT_DATA_SETS}?fields=dataSetElements[dataElement[id,name,shortName,valueType,aggregationType]]"
+        
+        self.logger.info(f"Fetching data elements from: {url}")  # Debugging Line
+        
+        response = requests.get(url, headers=self.HEADERS)
+
         if response.status_code == 200:
             data = response.json()
-            valid_data_elements = [
-                item["id"]
-                for item in data.get("dataElements", [])
-                if item.get("valueType") in ["INTEGER", "NUMBER", "PERCENTAGE", "UNIT_INTERVAL"]
-                and item.get("aggregationType") in ["SUM", "AVERAGE", "COUNT"]
+            
+            # Debugging: Print JSON Response
+            self.logger.info(f"Received Data Elements JSON: {json.dumps(data, indent=2)}")
+            
+            # Extract all data elements
+            all_data_elements = [
+                {
+                    "id": item["dataElement"]["id"],
+                    "name": item["dataElement"]["name"],
+                    "shortName": item["dataElement"].get("shortName", ""),
+                    "aggregationType": item["dataElement"].get("aggregationType", ""),
+                    "valueType": item["dataElement"].get("valueType", ""),
+                }
+                for item in data.get("dataSetElements", [])
             ]
-            return valid_data_elements
+            
+            # Convert to DataFrame
+            self.all_data_elements_df = pd.DataFrame(all_data_elements)
+            
+            # Save to CSV for reference
+            elements_file = self.data_dir / "all_data_elements.csv"
+            self.all_data_elements_df.to_csv(elements_file, index=False)
+            self.logger.info(f"All Data Elements saved to {elements_file}")
+
+            # Return only valid numeric data elements
+            numeric_data_elements = self.all_data_elements_df[self.all_data_elements_df["valueType"] == "NUMBER"]["id"].tolist()
+            
+            self.logger.info(f"Valid Numeric Data Elements: {numeric_data_elements}")
+            return numeric_data_elements
+
         else:
-            self.logger.error(f"Error fetching data elements: {response.status_code}")
+            self.logger.error(f"Error fetching data elements: {response.status_code} - {response.text}")
             return []
 
     def fetch_weekly_data(self, year=None, week=None):
-        # Fetches data for a specific week or current week if none specified.
-        # Returns a DataFrame with the weekly data.
-        # Get week period in DHIS2 format
+        """Fetches weekly data and ensures all dataset elements appear, even if missing."""
+        
+        # Ensure data elements are fetched
+        if self.all_data_elements_df is None:
+            self.fetch_aggregatable_data_elements()
+        
         start_date, end_date, period = self.get_week_range(year, week)
         
         self.logger.info(f"Fetching data for period: {period}")
         
-        # Get data elements
+        # Get all numeric data elements
         data_element_uids = self.fetch_aggregatable_data_elements()
         if not data_element_uids:
             raise ValueError("No valid data elements found")
@@ -146,19 +171,30 @@ class DHIS2DataExtractor:
                 self.logger.error(f"Error in batch {batch + 1}: {response.status_code}")
         
         return self._process_data(all_rows, period)
-    
+
     def _process_data(self, rows, period):
-        # Process the raw data into a pivoted DataFrame.
+        """Ensures all dataset elements appear in the final DataFrame, even if missing in the week."""
+        
         if not rows:
-            return pd.DataFrame()
+            # If no rows, create a DataFrame with all elements set to 0
+            elements_df = self.all_data_elements_df[self.all_data_elements_df["valueType"] == "NUMBER"]
+            data = {
+                "period": [period] * len(elements_df),
+                "org_id": ["LEVEL-4"] * len(elements_df),
+                "date": [datetime.strptime(f"{period[:4]}{period[5:]}1", "%G%V%w").strftime("%Y-%m-%dT00:00:00")] * len(elements_df)
+            }
+            for name in elements_df["name"]:
+                data[name] = [0] * len(elements_df)
+            
+            return pd.DataFrame(data)
         
         df = pd.DataFrame(rows, columns=["period", "org_id", "data_element", "value"])
         df.drop_duplicates(inplace=True)
-        
+
         # Convert period to date using correct format
         df["date"] = df["period"].apply(lambda x: 
             datetime.strptime(x[:4] + x[5:] + '1', "%G%V%w").strftime("%Y-%m-%dT00:00:00"))
-        
+
         # Pivot and process
         df_pivoted = df.pivot_table(
             index=["period", "org_id", "date"],
@@ -166,17 +202,25 @@ class DHIS2DataExtractor:
             values="value",
             aggfunc="sum"
         ).reset_index()
+
+        df_pivoted["date"] = pd.to_datetime(df_pivoted["date"])
         
-        df_pivoted["date"] = pd.to_datetime(df_pivoted['date'])
+        # Ensure all data elements are included
+        for de in self.all_data_elements_df["name"]:
+            if de not in df_pivoted.columns:
+                df_pivoted[de] = 0  # Fill missing data elements with 0
+        
         df_pivoted.fillna(0, inplace=True)
-        df_pivoted = df_pivoted.astype({col: 'int64' for col in df_pivoted.select_dtypes('float64').columns})
+        df_pivoted = df_pivoted.astype({col: "int64" for col in df_pivoted.select_dtypes("float64").columns})
         
         return df_pivoted
-    
+
     def fetch_and_save_weekly_data(self, start_year=None, start_week=None, end_year=None, end_week=None, combine=None):
-        # Fetch and save data for a range of weeks.
-        # If no parameters provided, fetches current week only.
-        
+        """Fetch and save data for a range of weeks."""
+        # Ensure data elements are fetched
+        if self.all_data_elements_df is None:
+            self.fetch_aggregatable_data_elements()
+
         all_weeks_data = []  # List to store DataFrames if combining
 
         if start_year is None:
@@ -231,33 +275,33 @@ class DHIS2DataExtractor:
         
         return None
 
-        def update_and_save_dataframes(self, dataframes, df_combined):
-            # Directory to save the updated CSV files
-            output_dir = self.data_dir
+    def update_and_save_dataframes(self, dataframes, df_combined):
+        """Update individual DataFrames to have consistent columns."""
+        # Directory to save the updated CSV files
+        output_dir = self.data_dir
 
-            # Get the list of all columns in the combined DataFrame
-            combined_columns = df_combined.columns.tolist()
+        # Get the list of all columns in the combined DataFrame
+        combined_columns = df_combined.columns.tolist()
 
-            # Loop through each DataFrame in the dictionary
-            for name, df in dataframes.items():
-                # Identify columns missing in the current DataFrame
-                missing_columns = set(combined_columns) - set(df.columns)
-                
-                # Add the missing columns with zeros
-                for col in missing_columns:
-                    df[col] = 0  # Add the column and fill with 0
-                
-                # Reorder columns to match the combined DataFrame's column order
-                dataframes[name] = df[combined_columns]
-                
-                # Save the updated DataFrame to a new CSV file
-                output_path = output_dir / f"{name}_mcols.csv"
-                df.to_csv(output_path, index=False)
+        # Loop through each DataFrame in the dictionary
+        for name, df in dataframes.items():
+            # Identify columns missing in the current DataFrame
+            missing_columns = set(combined_columns) - set(df.columns)
+            
+            # Add the missing columns with zeros
+            for col in missing_columns:
+                df[col] = 0  # Add the column and fill with 0
+            
+            # Reorder columns to match the combined DataFrame's column order
+            dataframes[name] = df[combined_columns]
+            
+            # Save the updated DataFrame to a new CSV file
+            output_path = output_dir / f"{name}_mcols.csv"
+            df.to_csv(output_path, index=False)
 
-                self.logger.info(f"Saved updated DataFrame '{name}' to {output_path}")
+            self.logger.info(f"Saved updated DataFrame '{name}' to {output_path}")
 
-            self.logger.info("All updated DataFrames saved.") 
-        
+        self.logger.info("All updated DataFrames saved.")
 
 # RUN
 if __name__ == "__main__":
@@ -268,22 +312,22 @@ if __name__ == "__main__":
     
     # Fetch specific week
     # extractor.fetch_and_save_weekly_data(2024, 1)
-    # extractor.fetch_and_save_weekly_data(2025, 1)
+    extractor.fetch_and_save_weekly_data(2025, 1)
     
     # Fetch range of weeks
     # extractor.fetch_and_save_weekly_data(2024, 1, 2024, 52)
     # extractor.fetch_and_save_weekly_data(2025, 1, 2025, 6)
 
-    # Fetch and get combined DataFrame and add missing columns
-    combined_df = extractor.fetch_and_save_weekly_data(2025, 1, 2025, 6, combine=True)    
-    if combined_df is not None:
-        # Save combined data if needed
-        combined_df.to_csv('nd2_combined.csv', index=False)
-        print("Periods in combined data:", sorted(combined_df['period'].unique()))
+    # # Fetch and get combined DataFrame and add missing columns
+    # combined_df = extractor.fetch_and_save_weekly_data(2025, 1, 2025, 6, combine=True)    
+    # if combined_df is not None:
+    #     # Save combined data if needed
+    #     combined_df.to_csv('nd2_combined.csv', index=False)
+    #     print("Periods in combined data:", sorted(combined_df['period'].unique()))
 
-        # Dictionary of DataFrames (can be created or fetched separately)
-        csv_files = list(extractor.data_dir.glob("nd2_2025W*.csv"))
-        dataframes = {file.stem: pd.read_csv(file) for file in csv_files}
+    #     # Dictionary of DataFrames (can be created or fetched separately)
+    #     csv_files = list(extractor.data_dir.glob("nd2_2025W*.csv"))
+    #     dataframes = {file.stem: pd.read_csv(file) for file in csv_files}
 
-        # Update individual DataFrames with the combined DataFrame's schema
-        extractor.update_and_save_dataframes(dataframes, combined_df)
+    #     # Update individual DataFrames with the combined DataFrame's schema
+    #     extractor.update_and_save_dataframes(dataframes, combined_df)
