@@ -1,333 +1,413 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.types import SMALLINT
+from airflow.utils import timezone
+import pendulum
+from datetime import datetime, timedelta
 import pandas as pd
 import requests
-import json
-from pathlib import Path
-from requests.auth import HTTPBasicAuth
-from datetime import datetime, timedelta
+import os
 import logging
+from airflow.operators.empty import EmptyOperator
+from airflow.models import Variable
 import math
 
-# ------ Directories, Credentials and Data Fetching and Transformation ---------------------------
-class DHIS2DataExtractor:
-    def __init__(self, base_dir=None):
-        # Setup logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
-        
-        # Setup paths
-        self.base_dir = Path.cwd().parent if base_dir is None else Path(base_dir)
-        self.credentials_path = self.base_dir / '00_Local' / '01_Configs' / 'credentials.txt'
-        self.data_dir = self.base_dir / '01_Fetch_Data' / 'exports'
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        
-        # DHIS2 configurations
-        self.DHIS2_URL = None
-        self.PAT = None
-        self.HEADERS = None
-        self.API_ENDPOINT_ANALYTICS = "/api/40/analytics.json"
-        self.API_ENDPOINT_DATA_SETS = "/api/40/dataSets/L5MxHpPrfFD.json"  # Fixed variable name
-        self.BATCH_SIZE = 200
-        
-        # Initialize configurations
-        self.all_data_elements_df = None  # Initialize DataFrame for data elements
-        self._load_credentials()
-        
-    def _load_credentials(self):
-        """Load DHIS2 credentials from text file."""
-        try:
-            credentials = {}
-            with self.credentials_path.open('r') as file:
-                for line in file:
-                    if '=' in line:
-                        key, value = line.strip().split('=', 1)
-                        credentials[key.strip()] = value.strip()
-            
-            self.DHIS2_URL = credentials.get('DHIS2_URL')
-            self.PAT = credentials.get('PAT')
-            self.HEADERS = {"Authorization": f"ApiToken {self.PAT}"}
-            self.logger.info(f"Credentials loaded successfully. DHIS2 instance: {self.DHIS2_URL}")
-            
-        except Exception as e:
-            self.logger.error(f"Error loading credentials: {str(e)}")
-            raise
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Constants
+BATCH_SIZE = 200  # Data elements per API request
+WEEK_BATCH_SIZE = 26  # Weeks per processing batch
+DHIS2_PAT = Variable.get("DHIS2_PAT")
+DHIS2_URL = Variable.get("DHIS2_BASE_URL")
+HEADERS = {"Authorization": f"ApiToken {DHIS2_PAT}"}
+API_ENDPOINT_ANALYTICS = "api/analytics.json"
+
+# File paths
+DATA_DIR = "<>"
+EXPORTS_DIR = "<>"
+INDICATORS_FILE = os.path.join(DATA_DIR, "data_elements.csv")
+OUTPUT_FILE = os.path.join(EXPORTS_DIR, "data_v1.csv")
+
+# DAG configuration
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': pendulum.datetime(2025, 2, 20, tz="Africa/Johannesburg"),
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG(
+    'nd2_data_v1',
+    default_args=default_args,
+    description='ND2 data pipeline with EPI week handling and advanced backfilling',
+    schedule_interval='0 3 * * 4',  # Run every Thursday at 3 AM
+    catchup=False
+)
+
+def week_to_date(week_str):
+    """Convert DHIS2 week format (YYYYWn) to Monday-based date"""
+    year = int(week_str[:4])
+    week = int(week_str[5:])  # Handles both single and double digit weeks
     
-    def get_week_range(self, year=None, week=None):
-        """Get the start and end dates for a specific epidemiological week."""
-        if year is None or week is None:
-            today = datetime.today()
-            year = today.year
-            week = today.isocalendar()[1]
-        
-        # Formats to DHIS2 Standard
-        start_date = datetime.strptime(f"{year}-W{week}-1", "%Y-W%W-%w")
-        end_date = start_date + timedelta(days=6)
-        return start_date, end_date, f"{year}W{week}"  # DHIS2 period format
+    # Find first Monday of the year
+    jan1 = datetime(year, 1, 1)
+    first_monday = jan1 + timedelta(days=(0 - jan1.weekday()) % 7)
     
-    def fetch_aggregatable_data_elements(self):
-        """Fetches all numeric data elements from the specified dataset and stores them in a DataFrame."""
-        
-        url = f"{self.DHIS2_URL}{self.API_ENDPOINT_DATA_SETS}?fields=dataSetElements[dataElement[id,name,shortName,valueType,aggregationType]]"
-        
-        self.logger.info(f"Fetching data elements from: {url}")  # Debugging Line
-        
-        response = requests.get(url, headers=self.HEADERS)
+    # Calculate week start date
+    return first_monday + timedelta(weeks=week-1)
 
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Debugging: Print JSON Response
-            self.logger.info(f"Received Data Elements JSON: {json.dumps(data, indent=2)}")
-            
-            # Extract all data elements
-            all_data_elements = [
-                {
-                    "id": item["dataElement"]["id"],
-                    "name": item["dataElement"]["name"],
-                    "shortName": item["dataElement"].get("shortName", ""),
-                    "aggregationType": item["dataElement"].get("aggregationType", ""),
-                    "valueType": item["dataElement"].get("valueType", ""),
-                }
-                for item in data.get("dataSetElements", [])
-            ]
-            
-            # Convert to DataFrame
-            self.all_data_elements_df = pd.DataFrame(all_data_elements)
-            
-            # Save to CSV for reference
-            elements_file = self.data_dir / "all_data_elements.csv"
-            self.all_data_elements_df.to_csv(elements_file, index=False)
-            self.logger.info(f"All Data Elements saved to {elements_file}")
+def date_to_epi_week(date_obj):
+    """Convert datetime to DHIS2 week format (YYYYWn) without leading zeros"""
+    # Find first Monday of the year
+    jan1 = datetime(date_obj.year, 1, 1)
+    first_monday = jan1 + timedelta(days=(0 - jan1.weekday()) % 7)
+    
+    # Calculate week number
+    delta = (date_obj - first_monday).days
+    week_number = (delta // 7) + 1
+    
+    # Handle year boundary cases
+    if week_number < 1:
+        prev_year_date = date_obj - timedelta(weeks=52)
+        return f"{prev_year_date.year}W{52}"
+    if week_number > 52:
+        next_year_date = date_obj + timedelta(weeks=52)
+        return f"{next_year_date.year}W1"
+    
+    return f"{date_obj.year}W{week_number}"
 
-            # Return only valid numeric data elements
-            numeric_data_elements = self.all_data_elements_df[self.all_data_elements_df["valueType"] == "NUMBER"]["id"].tolist()
-            
-            self.logger.info(f"Valid Numeric Data Elements: {numeric_data_elements}")
-            return numeric_data_elements
 
-        else:
-            self.logger.error(f"Error fetching data elements: {response.status_code} - {response.text}")
-            return []
+### Weekly data
+def get_last_n_weeks(n=1):
+    """Get last n EPI weeks in DHIS2 format (YYYYWn) based on current date"""
+    weeks = []
+    today = datetime.now()
+    
+    for i in range(n, 0, -1):
+        # Calculate date for each historical week
+        target_date = today - timedelta(weeks=i)
+        
+        # Convert to EPI week format using existing function
+        week_str = date_to_epi_week(target_date)
+        weeks.append(week_str)
+    
+    logger.info(f"Last {n} weeks: {weeks}")
+    return weeks
 
-    def fetch_weekly_data(self, year=None, week=None):
-        """Fetches weekly data and ensures all dataset elements appear, even if missing."""
+# Multiple Weeks
+def generate_weeks(start_year, start_week=None, end_year=None, end_week=None):
+    """Generate EPI weeks in DHIS2 format for various input types"""
+    def _to_date(year, week):
+        return week_to_date(f"{year}W{week}")
+
+    # Determine date range
+    if start_week and end_year and end_week:
+        # Specific week range
+        start_date = _to_date(start_year, start_week)
+        end_date = _to_date(end_year, end_week)
+    elif not start_week and end_year and not end_week:
+        # Year range
+        start_date = _to_date(start_year, 1)
+        end_date = _to_date(end_year, 52)
+    else:
+        # Single week
+        start_date = end_date = _to_date(start_year, start_week)
+
+    # Generate all Mondays in range
+    current_date = start_date
+    weeks = []
+    while current_date <= end_date:
+        week_str = date_to_epi_week(current_date)
+        weeks.append(week_str)
+        current_date += timedelta(weeks=1)
+
+    # Remove duplicates and sort descending
+    unique_weeks = list(dict.fromkeys(weeks))  # Preserve order while deduping
+    return sorted(unique_weeks,
+                key=lambda x: (int(x.split('W')[0]), int(x.split('W')[1])), 
+                reverse=True)
+
+
+def fetch_data_batch(data_elements, periods):
+    """Fetch data in batches from DHIS2 API"""
+    all_rows = []
+    params_base = {
+        "skipMeta": "true",
+        "includeNumDen": "false",
+        "dimension": ["ou:LEVEL-4"]
+    }
+
+    # Batch data elements
+    num_batches = math.ceil(len(data_elements) / BATCH_SIZE)
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * BATCH_SIZE
+        batch_elements = data_elements[batch_start:batch_start+BATCH_SIZE]
         
-        # Ensure data elements are fetched
-        if self.all_data_elements_df is None:
-            self.fetch_aggregatable_data_elements()
-        
-        start_date, end_date, period = self.get_week_range(year, week)
-        
-        self.logger.info(f"Fetching data for period: {period}")
-        
-        # Get all numeric data elements
-        data_element_uids = self.fetch_aggregatable_data_elements()
-        if not data_element_uids:
-            raise ValueError("No valid data elements found")
-        
-        # Process in batches
-        all_rows = []
-        num_batches = math.ceil(len(data_element_uids) / self.BATCH_SIZE)
-        
-        for batch in range(num_batches):
-            batch_uids = data_element_uids[batch * self.BATCH_SIZE : (batch + 1) * self.BATCH_SIZE]
-            dx_param = f"dx:{';'.join(batch_uids)}"
+        # Batch periods
+        num_week_batches = math.ceil(len(periods) / WEEK_BATCH_SIZE)
+        for week_batch_idx in range(num_week_batches):
+            week_start = week_batch_idx * WEEK_BATCH_SIZE
+            batch_weeks = periods[week_start:week_start+WEEK_BATCH_SIZE]
             
-            params = {
-                "dimension": [
-                    dx_param,
-                    "ou:LEVEL-4",
-                    f"pe:{period}"
-                ],
-                "displayProperty": "NAME",
-                "outputIdScheme": "UID",
-                "includeMetadata": "true",
-                "includeNames": "true",
-                "limit": 10000,
-                "paging": "true",
-                "page": 1
-            }
-            
-            response = requests.get(
-                f"{self.DHIS2_URL}{self.API_ENDPOINT_ANALYTICS}",
-                params=params,
-                headers=self.HEADERS
-            )
-            
-            if response.status_code == 200:
+            try:
+                response = requests.get(
+                    f"{DHIS2_URL}{API_ENDPOINT_ANALYTICS}",
+                    params={
+                        "dimension": [
+                            f"dx:{';'.join(batch_elements)}",
+                            f"pe:{';'.join(batch_weeks)}",
+                            "ou:LEVEL-4"
+                        ],
+                        "skipMeta": "true",
+                        "includeNumDen": "false"
+                    },
+                    headers=HEADERS,
+                    timeout=300
+                )
+                response.raise_for_status()
                 data = response.json()
-                metadata = data.get("metaData", {})
-                data_elements = metadata.get("items", {})
-                rows = data.get("rows", [])
-                
-                for row in rows:
-                    data_element_id = row[0]
-                    org_id = row[1]
-                    period = row[2]
-                    value = row[3]
-                    data_element_name = data_elements.get(data_element_id, {}).get("name", data_element_id)
-                    all_rows.append([period, org_id, data_element_name, value])
-            
-            else:
-                self.logger.error(f"Error in batch {batch + 1}: {response.status_code}")
-        
-        return self._process_data(all_rows, period)
+                if 'rows' in data:
+                    all_rows.extend(data['rows'])
+                logger.info(f"Batch {batch_idx+1}-{week_batch_idx+1} fetched {len(data.get('rows', []))} rows")
+            except Exception as e:
+                logger.error(f"Batch {batch_idx+1}-{week_batch_idx+1} failed: {str(e)}")
+    
+    if not all_rows:
+        return pd.DataFrame()
+    
+    columns = [h['name'] for h in data.get('headers', [])]
+    return pd.DataFrame(all_rows, columns=columns)
 
-    def _process_data(self, rows, period):
-        """Ensures all dataset elements appear in the final DataFrame, even if missing in the week."""
+def create_complete_dataset(raw_df, indicators_df, periods):
+    """Create sanitized dataset with proper typing and sorting"""
+    try:
+        # Sort indicators alphabetically
+        all_indicators = sorted(indicators_df['name'].unique())
         
-        if not rows:
-            # If no rows, create a DataFrame with all elements set to 0
-            elements_df = self.all_data_elements_df[self.all_data_elements_df["valueType"] == "NUMBER"]
-            data = {
-                "period": [period] * len(elements_df),
-                "org_id": ["LEVEL-4"] * len(elements_df),
-                "date": [datetime.strptime(f"{period[:4]}{period[5:]}1", "%G%V%w").strftime("%Y-%m-%dT00:00:00")] * len(elements_df)
-            }
-            for name in elements_df["name"]:
-                data[name] = [0] * len(elements_df)
-            
-            return pd.DataFrame(data)
-        
-        df = pd.DataFrame(rows, columns=["period", "org_id", "data_element", "value"])
-        df.drop_duplicates(inplace=True)
+        if raw_df.empty:
+            return pd.DataFrame(columns=['period', 'org_id', 'date'] + all_indicators)
 
-        # Convert period to date using correct format
-        df["date"] = df["period"].apply(lambda x: 
-            datetime.strptime(x[:4] + x[5:] + '1', "%G%V%w").strftime("%Y-%m-%dT00:00:00"))
+        # Merge and process data
+        merged = raw_df.merge(
+            indicators_df[['id', 'name']],
+            left_on='dx',
+            right_on='id',
+            how='left'
+        ).drop(columns=['id']).fillna(0)
 
-        # Pivot and process
-        df_pivoted = df.pivot_table(
-            index=["period", "org_id", "date"],
-            columns="data_element",
-            values="value",
-            aggfunc="sum"
+        # Pivot with proper null handling
+        pivoted = merged.pivot_table(
+            index=['pe', 'ou'],
+            columns='name',
+            values='value',
+            aggfunc='first',
+            fill_value=0
         ).reset_index()
 
-        df_pivoted["date"] = pd.to_datetime(df_pivoted["date"])
+        # Generate complete facility-week matrix
+        facilities = merged['ou'].unique()
+        week_facility_combos = [(p, ou) for p in periods for ou in facilities]
+        base_df = pd.DataFrame(week_facility_combos, columns=['period', 'org_id'])
+        base_df['date'] = base_df['period'].apply(week_to_date)
+
+        # Merge with pivoted data
+        complete_df = base_df.merge(
+            pivoted.rename(columns={'pe': 'period', 'ou': 'org_id'}),
+            on=['period', 'org_id'],
+            how='left'
+        ).fillna(0)
+
+        # Ensure all columns exist
+        for indicator in all_indicators:
+            if indicator not in complete_df:
+                complete_df[indicator] = 0
+
+        # Convert to smallint and sort
+        type_conversion = {indicator: 'int16' for indicator in all_indicators}
+        complete_df = complete_df.astype(type_conversion, errors='ignore')
+        complete_df = complete_df[['period', 'org_id', 'date'] + all_indicators]\
+                       .sort_values(['date', 'org_id'], ascending=[False, True])
+
+        return complete_df
+
+    except Exception as e:
+        logger.error(f"Dataset creation failed: {str(e)}")
+        return pd.DataFrame()
+
+def backfill_historical_data(**kwargs):
+    """Flexible backfill with EPI week handling"""
+    try:
+        # Load indicators
+        indicators_df = pd.read_csv(INDICATORS_FILE)
+        data_elements = indicators_df['id'].tolist()
         
-        # Ensure all data elements are included
-        for de in self.all_data_elements_df["name"]:
-            if de not in df_pivoted.columns:
-                df_pivoted[de] = 0  # Fill missing data elements with 0
+        # Generate weeks based on input parameters
+        weeks = generate_weeks(
+            start_year=kwargs.get('start_year'),
+            start_week=kwargs.get('start_week'),
+            end_year=kwargs.get('end_year'),
+            end_week=kwargs.get('end_week')
+        )
+        logger.info(f"Processing {len(weeks)} weeks from {weeks[0]} to {weeks[-1]}")
+
+        # Process in weekly batches
+        all_data = []
+        for i in range(0, len(weeks), WEEK_BATCH_SIZE):
+            batch_weeks = weeks[i:i+WEEK_BATCH_SIZE]
+            logger.info(f"Processing batch {i//WEEK_BATCH_SIZE+1}: {batch_weeks[0]} to {batch_weeks[-1]}")
+            
+            batch_df = fetch_data_batch(data_elements, batch_weeks)
+            if not batch_df.empty:
+                processed = create_complete_dataset(batch_df, indicators_df, batch_weeks)
+                all_data.append(processed)
+
+        if not all_data:
+            logger.error("No data collected during backfill")
+            return
+
+        final_df = pd.concat(all_data, ignore_index=True)
         
-        df_pivoted.fillna(0, inplace=True)
-        df_pivoted = df_pivoted.astype({col: "int64" for col in df_pivoted.select_dtypes("float64").columns})
+        # Save to CSV
+        final_df.to_csv(OUTPUT_FILE, index=False)
+        logger.info(f"Saved {len(final_df)} records to CSV")
+
+        # Update PostgreSQL
+        hook = PostgresHook(postgres_conn_id="superset_db")
+        engine = hook.get_sqlalchemy_engine()
         
-        return df_pivoted
+        with engine.begin() as conn:
+            # Clear existing data in range
+            conn.execute(f"""
+                DELETE FROM nd2_data 
+                WHERE period BETWEEN %s AND %s
+            """, (weeks[-1], weeks[0]))
+            
+            # Insert new data with smallint types
+            final_df.to_sql(
+                'nd2_data',
+                con=conn,
+                if_exists='append',
+                index=False,
+                method='multi',
+                chunksize=1000,
+                dtype={col: SMALLINT() for col in final_df.columns if col not in ['period', 'org_id', 'date']}
+            )
+        
+        logger.info(f"Backfilled {len(final_df)} records to PostgreSQL")
 
-    def fetch_and_save_weekly_data(self, start_year=None, start_week=None, end_year=None, end_week=None, combine=None):
-        """Fetch and save data for a range of weeks."""
-        # Ensure data elements are fetched
-        if self.all_data_elements_df is None:
-            self.fetch_aggregatable_data_elements()
+    except Exception as e:
+        logger.error(f"Backfill failed: {str(e)}")
+        raise
 
-        all_weeks_data = []  # List to store DataFrames if combining
+def process_and_append_data(**context):
+    """Weekly update process with null handling"""
+    hook = PostgresHook(postgres_conn_id="superset_db")
+    engine = hook.get_sqlalchemy_engine()
 
-        if start_year is None:
-            # Fetch only current week
-            df = self.fetch_weekly_data()
-            if not df.empty:
-                period = df['period'].iloc[0]
-                filename = f"nd2_{period}.csv"
-                df.to_csv(self.data_dir / filename, index=False)
-                self.logger.info(f"Saved data to {filename}")
-                return df if combine else None
-            return None
+    try:
+        # Fetch new data
+        logger.info("Fetching latest data...")
+        indicators_df = pd.read_csv(INDICATORS_FILE)
+        data_elements = indicators_df['id'].tolist()
+        weeks = get_last_n_weeks(1)  # Get last week's data
+        df = fetch_data_batch(data_elements, weeks)
+        
+        if df.empty:
+            logger.error("No data fetched")
+            return
 
-        # Handle the week range directly
-        if end_year is None or end_week is None:
-            end_year = start_year
-            end_week = start_week
+        # Process data
+        processed_df = create_complete_dataset(df, indicators_df, weeks)
+        if processed_df.empty:
+            logger.error("Data processing failed")
+            return
 
-        # Create list of weeks to process
-        weeks_to_process = []
-        if start_year == end_year:
-            weeks_to_process = [(start_year, week) for week in range(start_week, end_week + 1)]
+        # CSV Operations
+        if os.path.exists(OUTPUT_FILE):
+            existing_df = pd.read_csv(OUTPUT_FILE)
+            combined_df = pd.concat([existing_df, processed_df], ignore_index=True)
+            combined_df = combined_df.drop_duplicates(['period', 'org_id'], keep='last')
+            combined_df.sort_values(['date', 'org_id'], ascending=[False, True], inplace=True)
+            combined_df.to_csv(OUTPUT_FILE, index=False)
         else:
-            # Handle multi-year ranges if needed
-            current_year = start_year
-            current_week = start_week
-            
-            while current_year < end_year or (current_year == end_year and current_week <= end_week):
-                weeks_to_process.append((current_year, current_week))
-                current_week += 1
-                
-                # Handle year transition
-                if current_year < end_year and current_week > 52:
-                    current_year += 1
-                    current_week = 1
-
-        # Process each week
-        for year, week in weeks_to_process:
-            df = self.fetch_weekly_data(year, week)
-            if not df.empty:
-                filename = f"nd2_{year}W{week}.csv"
-                df.to_csv(self.data_dir / filename, index=False)
-                self.logger.info(f"Saved data to {filename}")
-                
-                if combine:
-                    all_weeks_data.append(df)
+            processed_df.to_csv(OUTPUT_FILE, index=False)
         
-        if combine and all_weeks_data:
-            combined_df = pd.concat(all_weeks_data, ignore_index=True)
-            combined_df.sort_values('period', ascending=False, inplace=True)
-            return combined_df
+        logger.info(f"Updated CSV with {len(processed_df)} new records")
+
+        # PostgreSQL Operations
+        with engine.begin() as conn:
+            processed_df.to_sql(
+                'nd2_data',
+                con=conn,
+                if_exists='append',
+                index=False,
+                method='multi',
+                dtype={col: SMALLINT() for col in processed_df.columns if col not in ['period', 'org_id', 'date']}
+            )
         
-        return None
+        logger.info(f"Updated PostgreSQL with {len(processed_df)} records")
 
-    def update_and_save_dataframes(self, dataframes, df_combined):
-        """Update individual DataFrames to have consistent columns."""
-        # Directory to save the updated CSV files
-        output_dir = self.data_dir
+    except Exception as e:
+        logger.error(f"Update failed: {str(e)}")
+        raise
 
-        # Get the list of all columns in the combined DataFrame
-        combined_columns = df_combined.columns.tolist()
+# Define tasks
+start_task = EmptyOperator(task_id='start', dag=dag)
 
-        # Loop through each DataFrame in the dictionary
-        for name, df in dataframes.items():
-            # Identify columns missing in the current DataFrame
-            missing_columns = set(combined_columns) - set(df.columns)
-            
-            # Add the missing columns with zeros
-            for col in missing_columns:
-                df[col] = 0  # Add the column and fill with 0
-            
-            # Reorder columns to match the combined DataFrame's column order
-            dataframes[name] = df[combined_columns]
-            
-            # Save the updated DataFrame to a new CSV file
-            output_path = output_dir / f"{name}_mcols.csv"
-            df.to_csv(output_path, index=False)
+fetch_weekly_task = PythonOperator(
+    task_id='fetch_weekly_data',
+    python_callable=process_and_append_data,
+    dag=dag,
+)
 
-            self.logger.info(f"Saved updated DataFrame '{name}' to {output_path}")
+backfill_task = PythonOperator(
+    task_id='backfill_data',
+    python_callable=backfill_historical_data,
+    op_kwargs={
+        'start_year': 2025,
+        'start_week': 1,
+        'end_year': 2025,
+        'end_week': 10
+    },
+    dag=dag,
+    trigger_rule='none_failed',
+)
 
-        self.logger.info("All updated DataFrames saved.")
 
-# RUN
-if __name__ == "__main__":
-    extractor = DHIS2DataExtractor()
-    
-    # Fetch current week only
-    # extractor.fetch_and_save_weekly_data()
-    
-    # Fetch specific week
-    # extractor.fetch_and_save_weekly_data(2024, 1)
-    extractor.fetch_and_save_weekly_data(2025, 1)
-    
-    # Fetch range of weeks
-    # extractor.fetch_and_save_weekly_data(2024, 1, 2024, 52)
-    # extractor.fetch_and_save_weekly_data(2025, 1, 2025, 6)
+# Other backfills:
 
-    # # Fetch and get combined DataFrame and add missing columns
-    # combined_df = extractor.fetch_and_save_weekly_data(2025, 1, 2025, 6, combine=True)    
-    # if combined_df is not None:
-    #     # Save combined data if needed
-    #     combined_df.to_csv('nd2_combined.csv', index=False)
-    #     print("Periods in combined data:", sorted(combined_df['period'].unique()))
+# # Single week
+# PythonOperator(
+#     task_id='backfill_single_week',
+#     python_callable=backfill_historical_data,
+#     op_kwargs={'start_year': 2024, 'start_week': 1},
+#     dag=dag
+# )
 
-    #     # Dictionary of DataFrames (can be created or fetched separately)
-    #     csv_files = list(extractor.data_dir.glob("nd2_2025W*.csv"))
-    #     dataframes = {file.stem: pd.read_csv(file) for file in csv_files}
+# # Week range
+# PythonOperator(
+#     task_id='backfill_week_range',
+#     python_callable=backfill_historical_data,
+#     op_kwargs={'start_year': 2024, 'start_week': 1, 'end_year': 2025, 'end_week': 11},
+#     dag=dag
+# )
 
-    #     # Update individual DataFrames with the combined DataFrame's schema
-    #     extractor.update_and_save_dataframes(dataframes, combined_df)
+# # Year range
+# PythonOperator(
+#     task_id='backfill_year_range',
+#     python_callable=backfill_historical_data,
+#     op_kwargs={'start_year': 2020, 'end_year': 2025},
+#     dag=dag
+# )
+
+
+
+end_task = EmptyOperator(task_id='end', dag=dag)
+
+# Set dependencies
+start_task >> [fetch_weekly_task, backfill_task] >> end_task
