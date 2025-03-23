@@ -173,6 +173,6 @@ cython_debug/
 
 # Project Configuration Files
 .ipynb_checkpoints/
-00_Local/
+data/
 *.csv
 *.ipynb
