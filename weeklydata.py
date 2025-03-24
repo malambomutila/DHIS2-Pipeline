@@ -30,19 +30,21 @@ API_ENDPOINT_ANALYTICS = "api/analytics.json"
 DATA_DIR = "<>"
 EXPORTS_DIR = "<>"
 INDICATORS_FILE = os.path.join(DATA_DIR, "data_elements.csv")
-OUTPUT_FILE = os.path.join(EXPORTS_DIR, "data_v1.csv")
+OUTPUT_FILE = os.path.join(EXPORTS_DIR, "nd2_data.csv")
 
 # DAG configuration
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': pendulum.datetime(2025, 2, 20, tz="Africa/Johannesburg"),
+    'start_date': datetime(2025, 2, 20),
     'retries': 3,
     'retry_delay': timedelta(minutes=5),
 }
 
+logger.info("DAG configure successfully")
+
 dag = DAG(
-    'nd2_data_v1',
+    'nd2_data_v1_postgres',
     default_args=default_args,
     description='ND2 data pipeline with EPI week handling and advanced backfilling',
     schedule_interval='0 3 * * 4',  # Run every Thursday at 3 AM
@@ -227,9 +229,15 @@ def create_complete_dataset(raw_df, indicators_df, periods):
             if indicator not in complete_df:
                 complete_df[indicator] = 0
 
-        # Convert to smallint and sort
-        type_conversion = {indicator: 'int16' for indicator in all_indicators}
-        complete_df = complete_df.astype(type_conversion, errors='ignore')
+        # Explicitly convert indicator columns to int16 by rounding values first
+        for indicator in all_indicators:
+            complete_df[indicator] = (
+                pd.to_numeric(complete_df[indicator], errors='coerce')
+                .fillna(0)
+                .round(0)
+                .astype('int16')
+            )
+
         complete_df = complete_df[['period', 'org_id', 'date'] + all_indicators]\
                        .sort_values(['date', 'org_id'], ascending=[False, True])
 
@@ -238,6 +246,83 @@ def create_complete_dataset(raw_df, indicators_df, periods):
     except Exception as e:
         logger.error(f"Dataset creation failed: {str(e)}")
         return pd.DataFrame()
+
+
+def update_database(df, engine, weeks):
+    """Update PostgreSQL database with new data"""
+    try:
+        # Check if table exists first
+        inspector = inspect(engine)
+        table_exists = inspector.has_table('nd2_data')
+        
+        with engine.begin() as conn:
+            # Create table if it doesn't exist
+            if not table_exists:
+                logger.info("Creating nd2_data table as it doesn't exist")
+                # Sort DataFrame by date and org_id
+                df.sort_values(['date', 'org_id'], ascending=[False, True], inplace=True)
+                # Create table using DataFrame structure
+                df.to_sql(
+                    'nd2_data',
+                    con=conn,
+                    if_exists='replace',  # Creates new table
+                    index=False,
+                    dtype={col: SMALLINT() for col in df.columns if col not in ['period', 'org_id', 'date']}
+                )
+                logger.info("nd2_data table created successfully")
+            else:
+                # Clear existing data in range if weeks are provided
+                if weeks:
+                    min_week = min(weeks, key=lambda x: (int(x.split('W')[0]), int(x.split('W')[1])))
+                    max_week = max(weeks, key=lambda x: (int(x.split('W')[0]), int(x.split('W')[1])))
+                    logger.info(f"Clearing data for period range: {min_week} to {max_week}")
+                    conn.execute(f"""
+                        DELETE FROM nd2_data 
+                        WHERE period BETWEEN %s AND %s
+                    """, (min_week, max_week))
+            
+                # Insert new data if not empty and table already existed
+                if not df.empty:
+                    df.to_sql(
+                        'nd2_data',
+                        con=conn,
+                        if_exists='append',
+                        index=False,
+                        method='multi',
+                        chunksize=1000,
+                        dtype={col: SMALLINT() for col in df.columns if col not in ['period', 'org_id', 'date']}
+                    )
+                    logger.info(f"Added {len(df)} records to PostgreSQL")
+            
+    except Exception as e:
+        logger.error(f"Database update failed: {str(e)}")
+        raise
+
+def update_csv(df, target_file):
+    """Update CSV file with new data, handling duplicates"""
+    try:
+        if os.path.exists(target_file):
+            # Read existing data
+            existing_df = pd.read_csv(target_file)
+            
+            # Combine with new data
+            combined_df = pd.concat([existing_df, df], ignore_index=True)
+            
+            # Remove duplicates, keeping newest version
+            combined_df = combined_df.drop_duplicates(['period', 'org_id'], keep='last')
+            
+            # Sort and save
+            combined_df.sort_values(['date', 'org_id'], ascending=[False, True], inplace=True)
+            combined_df.to_csv(target_file, index=False)
+            logger.info(f"Updated CSV with {len(df)} new records, total: {len(combined_df)}")
+        else:
+            # Create new file
+            df.to_csv(target_file, index=False)
+            logger.info(f"Created new CSV with {len(df)} records")
+
+    except Exception as e:
+        logger.error(f"CSV update failed: {str(e)}")
+        raise
 
 def backfill_historical_data(**kwargs):
     """Flexible backfill with EPI week handling"""
@@ -273,32 +358,14 @@ def backfill_historical_data(**kwargs):
         final_df = pd.concat(all_data, ignore_index=True)
         
         # Save to CSV
-        final_df.to_csv(OUTPUT_FILE, index=False)
-        logger.info(f"Saved {len(final_df)} records to CSV")
-
+        update_csv(final_df, OUTPUT_FILE)
+        
         # Update PostgreSQL
         hook = PostgresHook(postgres_conn_id="superset_db")
         engine = hook.get_sqlalchemy_engine()
+        update_database(final_df, engine, weeks)
         
-        with engine.begin() as conn:
-            # Clear existing data in range
-            conn.execute(f"""
-                DELETE FROM nd2_data 
-                WHERE period BETWEEN %s AND %s
-            """, (weeks[-1], weeks[0]))
-            
-            # Insert new data with smallint types
-            final_df.to_sql(
-                'nd2_data',
-                con=conn,
-                if_exists='append',
-                index=False,
-                method='multi',
-                chunksize=1000,
-                dtype={col: SMALLINT() for col in final_df.columns if col not in ['period', 'org_id', 'date']}
-            )
-        
-        logger.info(f"Backfilled {len(final_df)} records to PostgreSQL")
+        logger.info(f"Backfill completed for {len(final_df)} records")
 
     except Exception as e:
         logger.error(f"Backfill failed: {str(e)}")
@@ -306,9 +373,6 @@ def backfill_historical_data(**kwargs):
 
 def process_and_append_data(**context):
     """Weekly update process with null handling"""
-    hook = PostgresHook(postgres_conn_id="superset_db")
-    engine = hook.get_sqlalchemy_engine()
-
     try:
         # Fetch new data
         logger.info("Fetching latest data...")
@@ -327,30 +391,17 @@ def process_and_append_data(**context):
             logger.error("Data processing failed")
             return
 
-        # CSV Operations
-        if os.path.exists(OUTPUT_FILE):
-            existing_df = pd.read_csv(OUTPUT_FILE)
-            combined_df = pd.concat([existing_df, processed_df], ignore_index=True)
-            combined_df = combined_df.drop_duplicates(['period', 'org_id'], keep='last')
-            combined_df.sort_values(['date', 'org_id'], ascending=[False, True], inplace=True)
-            combined_df.to_csv(OUTPUT_FILE, index=False)
-        else:
-            processed_df.to_csv(OUTPUT_FILE, index=False)
+        # Update CSV
+        update_csv(processed_df, OUTPUT_FILE)
+        logger.info(f"Saved CSV to {OUTPUT_FILE}")
         
-        logger.info(f"Updated CSV with {len(processed_df)} new records")
-
-        # PostgreSQL Operations
-        with engine.begin() as conn:
-            processed_df.to_sql(
-                'nd2_data',
-                con=conn,
-                if_exists='append',
-                index=False,
-                method='multi',
-                dtype={col: SMALLINT() for col in processed_df.columns if col not in ['period', 'org_id', 'date']}
-            )
+        # Update PostgreSQL
+        hook = PostgresHook(postgres_conn_id="superset_db")
+        engine = hook.get_sqlalchemy_engine()
+        update_database(processed_df, engine, weeks)
+        logger.info(f"Saved to Postgres DB")
         
-        logger.info(f"Updated PostgreSQL with {len(processed_df)} records")
+        logger.info(f"Weekly update completed for {len(processed_df)} records")
 
     except Exception as e:
         logger.error(f"Update failed: {str(e)}")
